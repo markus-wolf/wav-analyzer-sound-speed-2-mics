@@ -59,17 +59,50 @@ DARK_FONT = "#cccccc"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def load_wav(uploaded_file) -> tuple[int, np.ndarray]:
-    """Load WAV, collapse to mono float64 in [−1, 1]."""
+def load_audio(uploaded_file) -> tuple[int, np.ndarray]:
+    """Load WAV or M4A, collapse to mono float64 in [−1, 1].
+
+    WAV is decoded with scipy (no external deps).
+    M4A/AAC is decoded with pydub, which requires ffmpeg on PATH.
+    """
     raw = uploaded_file.read()
-    rate, data = wavfile.read(io.BytesIO(raw))
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    data = data.astype(np.float64)
-    peak = np.max(np.abs(data))
+    name = uploaded_file.name.lower()
+
+    if name.endswith(".m4a"):
+        try:
+            from pydub import AudioSegment  # noqa: PLC0415
+        except ImportError:
+            st.error(
+                "**pydub** is needed to read M4A files.  "
+                "Install it with:  `pip install pydub`"
+            )
+            st.stop()
+        try:
+            seg = AudioSegment.from_file(io.BytesIO(raw), format="m4a")
+        except Exception as exc:
+            st.error(
+                f"Could not decode M4A file: {exc}\n\n"
+                "Make sure **ffmpeg** is installed and on your PATH  "
+                "(`brew install ffmpeg` on macOS)."
+            )
+            st.stop()
+        rate = seg.frame_rate
+        samples = np.array(seg.get_array_of_samples(), dtype=np.float64)
+        if seg.channels > 1:
+            samples = samples.reshape(-1, seg.channels).mean(axis=1)
+        max_val = float(2 ** (8 * seg.sample_width - 1))
+        if max_val > 0:
+            samples /= max_val
+    else:
+        rate, data = wavfile.read(io.BytesIO(raw))
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        samples = data.astype(np.float64)
+
+    peak = np.max(np.abs(samples))
     if peak > 0:
-        data /= peak
-    return rate, data
+        samples /= peak
+    return rate, samples
 
 
 def compute_spectrogram(
@@ -318,9 +351,12 @@ st.markdown(
 st.header("1 · Load recording")
 
 uploaded = st.file_uploader(
-    "Upload a mono or stereo WAV file",
-    type=["wav"],
-    help="Stereo files are collapsed to mono by averaging the two channels.",
+    "Upload a WAV or M4A file",
+    type=["wav", "m4a"],
+    help=(
+        "Stereo files are collapsed to mono by averaging channels.  "
+        "M4A decoding requires **ffmpeg** on PATH (`brew install ffmpeg`)."
+    ),
 )
 
 if uploaded is None:
@@ -334,7 +370,7 @@ if uploaded is None:
     )
     st.stop()
 
-rate, data = load_wav(uploaded)
+rate, data = load_audio(uploaded)
 duration = len(data) / rate
 t_audio = np.linspace(0, duration, len(data))
 
