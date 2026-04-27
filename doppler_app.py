@@ -221,6 +221,28 @@ def doppler_calc(
     return r, beta, f0
 
 
+def doppler_approach_only_calc(
+    f_approach: float, f0: float
+) -> tuple[float, float]:
+    """Return (ratio f_approach/f0, beta β) for an approaching source only."""
+    ratio = f_approach / f0
+    beta = 1.0 - (f0 / f_approach)
+    return ratio, beta
+
+
+def doppler_known_base_pair_calc(
+    f_approach: float, f_retreat: float, f0: float
+) -> tuple[float, float, float, float]:
+    """Return (approach ratio, retreat ratio, beta, beta spread) using known f0."""
+    approach_ratio = f_approach / f0
+    retreat_ratio = f0 / f_retreat
+    beta_approach = 1.0 - (f0 / f_approach)
+    beta_retreat = (f0 / f_retreat) - 1.0
+    beta = 0.5 * (beta_approach + beta_retreat)
+    beta_spread = abs(beta_approach - beta_retreat)
+    return approach_ratio, retreat_ratio, beta, beta_spread
+
+
 def dark_layout(fig: go.Figure, height: int = 320, **extra) -> None:
     """Apply consistent dark-theme layout to a Plotly figure."""
     fig.update_layout(
@@ -251,7 +273,7 @@ with st.sidebar:
     )
     freq_max_inp = st.number_input(
         "Max frequency (Hz)", min_value=100, max_value=24_000,
-        value=4_000, step=100,
+        value=2_000, step=100,
         help="Ignore everything above this frequency.",
     )
 
@@ -282,11 +304,55 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Calculation mode")
+    interval_mode = st.radio(
+        "Doppler intervals",
+        options=[
+            "Approach + retreat windows",
+            "Advancing interval only",
+        ],
+        index=1,
+        help=(
+            "Use approach + retreat when both sides of the pass are visible. "
+            "Use advancing interval only when the main analysis time window "
+            "contains just the approaching part of the motion."
+        ),
+    )
     calc_mode = st.radio(
         "What do you want to find?",
         options=["Source speed  (v_s)", "Speed of sound  (v_c)"],
-        index=0,
+        index=1,
     )
+
+    if interval_mode.startswith("Advancing"):
+        base_freq_mode = "Set explicitly"
+        st.caption(
+            "Advancing-only analysis requires the unshifted source frequency."
+        )
+    else:
+        base_freq_mode = st.radio(
+            "Base frequency f0",
+            options=["Estimate from approach/retreat", "Set explicitly"],
+            index=0,
+            help=(
+                "If your source is configured to emit a fixed tone, set it "
+                "explicitly. Otherwise the app estimates f0 from the selected "
+                "approach and retreat extrema."
+            ),
+        )
+
+    if base_freq_mode == "Set explicitly":
+        f0_known_inp = st.number_input(
+            "Base / true source frequency (Hz)",
+            min_value=0.001,
+            max_value=100_000.0,
+            value=1000.0,
+            step=1.0,
+            help=(
+                "Unshifted tone frequency emitted by the source."
+            ),
+        )
+    else:
+        f0_known_inp = None
 
     if calc_mode.startswith("Source"):
         v_sound_inp = st.number_input(
@@ -298,6 +364,7 @@ with st.sidebar:
         speed_input_mode = st.radio(
             "Specify source speed as",
             options=["Direct (m/s)", "Release height (m)"],
+            index=1,
             horizontal=True,
             help=(
                 "Release height uses energy conservation "
@@ -314,7 +381,7 @@ with st.sidebar:
             release_h = st.number_input(
                 "Release height above swing bottom (m)",
                 min_value=0.001, max_value=100.0,
-                value=0.20, step=0.01,
+                value=1.35, step=0.01,
                 help="Height h above the lowest point from which the pendulum is released.",
             )
             v_source_inp = float(np.sqrt(2 * 9.80665 * release_h))
@@ -451,10 +518,8 @@ fig_wave.add_vline(x=t_win_start, line=dict(color="#ffcc00", width=1, dash="dot"
 fig_wave.add_vline(x=t_win_end,   line=dict(color="#ffcc00", width=1, dash="dot"))
 
 # ---------------------------------------------------------------------------
-# 3 · Spectrogram + frequency track
+# Compute spectrogram + frequency track for downstream analysis
 # ---------------------------------------------------------------------------
-st.header("3 · Spectrogram & frequency track")
-
 with st.spinner("Computing spectrogram…"):
     f_spec, t_spec, Sxx = compute_spectrogram(
         data_win, rate,
@@ -471,136 +536,93 @@ with st.spinner("Computing spectrogram…"):
 
 bin_hz = rate / nperseg_inp
 frame_ms = (nperseg_inp * (1.0 - overlap_inp / 100.0)) / rate * 1000
-st.caption(
-    f"FFT bin width: **{bin_hz:.2f} Hz/bin** · "
-    f"Frame step: **{frame_ms:.1f} ms** · "
-    f"Sub-bin interpolation enabled (effective resolution < 1 bin)"
-)
 
 Sxx_db = 10 * np.log10(Sxx + 1e-12)
 vmin = float(np.percentile(Sxx_db, 20))
 vmax = float(np.percentile(Sxx_db, 99.5))
-
-fig_spec = go.Figure()
-fig_spec.add_trace(go.Heatmap(
-    x=t_spec,
-    y=f_spec,
-    z=Sxx_db,
-    zmin=vmin, zmax=vmax,
-    colorscale="Viridis",
-    colorbar=dict(title=dict(text="dB", font=dict(color=DARK_FONT)),
-                  tickfont=dict(color=DARK_FONT)),
-    hovertemplate="t=%{x:.3f} s<br>f=%{y:.0f} Hz<br>%{z:.1f} dB<extra></extra>",
-))
-fig_spec.add_trace(go.Scatter(
-    x=t_spec, y=f_smooth,
-    mode="lines",
-    line=dict(color="red", width=2),
-    name="tracked freq",
-    hovertemplate="t=%{x:.3f} s<br>f=%{y:.1f} Hz<extra>tracked</extra>",
-))
-dark_layout(fig_spec, height=350)
-fig_spec.update_layout(
-    xaxis_title="Time (s)",
-    yaxis_title="Frequency (Hz)",
-    legend=dict(
-        bgcolor="rgba(0,0,0,0.5)", font=dict(color=DARK_FONT),
-        x=0.01, y=0.97,
-    ),
-)
-st.plotly_chart(fig_spec, width="stretch")
-
-# Frequency track standalone
-with st.expander("Frequency track detail"):
-    fig_ftrack = go.Figure()
-    fig_ftrack.add_trace(go.Scatter(
-        x=t_spec, y=f_raw,
-        mode="lines",
-        line=dict(color="rgba(100,160,255,0.5)", width=1),
-        name="raw peak",
-    ))
-    fig_ftrack.add_trace(go.Scatter(
-        x=t_spec, y=f_smooth,
-        mode="lines",
-        line=dict(color="orange", width=2),
-        name="smoothed",
-    ))
-    dark_layout(fig_ftrack, height=280)
-    fig_ftrack.update_layout(
-        xaxis_title="Time (s)",
-        yaxis_title="Frequency (Hz)",
-        legend=dict(bgcolor="rgba(0,0,0,0.5)", font=dict(color=DARK_FONT)),
-    )
-    st.plotly_chart(fig_ftrack, width="stretch")
 
 # ---------------------------------------------------------------------------
 # 4 · Doppler analysis — window selection
 # ---------------------------------------------------------------------------
 st.header("4 · Doppler analysis")
 
-# Auto-detect starting windows
-auto_a_start, auto_a_end, auto_r_start, auto_r_end = auto_detect_windows(
-    t_spec, f_smooth
-)
-
-st.markdown(
-    "**Mic along the swing path:** the Doppler extremes are a sharp **peak** "
-    "(just before the source passes the mic) and a sharp **trough** (just after). "
-    "Place each window to bracket that peak/trough — the app takes the "
-    "**maximum** frequency in the approach window and the **minimum** in the retreat window."
-)
-
-col_a, col_b = st.columns(2, gap="large")
-
 _win_dur  = t_win_end - t_win_start
 _win_step = max(0.001, round(_win_dur / 1000, 3))
 
-with col_a:
-    st.markdown("##### 📈 Approach peak window  *(highest frequency)*")
-    a_start = st.slider(
-        "Start (s)", key="a_start",
-        min_value=t_win_start, max_value=t_win_end,
-        value=float(np.clip(round(auto_a_start, 3), t_win_start, t_win_end)),
-        step=_win_step,
+if interval_mode.startswith("Advancing"):
+    st.markdown(
+        "**Advancing interval only:** the selected analysis window is treated as "
+        "the approaching part of the motion. The app takes the **maximum** "
+        "frequency in that time window and compares it with the supplied base "
+        "frequency."
     )
-    a_end = st.slider(
-        "End (s)", key="a_end",
-        min_value=t_win_start, max_value=t_win_end,
-        value=float(np.clip(round(auto_a_end, 3), t_win_start, t_win_end)),
-        step=_win_step,
+    a_start = t_win_start
+    a_end = t_win_end
+    r_start = None
+    r_end = None
+else:
+    # Auto-detect starting windows
+    auto_a_start, auto_a_end, auto_r_start, auto_r_end = auto_detect_windows(
+        t_spec, f_smooth
     )
 
-with col_b:
-    st.markdown("##### 📉 Retreat trough window  *(lowest frequency)*")
-    r_start = st.slider(
-        "Start (s)", key="r_start",
-        min_value=t_win_start, max_value=t_win_end,
-        value=float(np.clip(round(auto_r_start, 3), t_win_start, t_win_end)),
-        step=_win_step,
+    st.markdown(
+        "**Mic along the swing path:** the Doppler extremes are a sharp **peak** "
+        "(just before the source passes the mic) and a sharp **trough** (just after). "
+        "Place each window to bracket that peak/trough — the app takes the "
+        "**maximum** frequency in the approach window and the **minimum** in the retreat window."
     )
-    r_end = st.slider(
-        "End (s)", key="r_end",
-        min_value=t_win_start, max_value=t_win_end,
-        value=float(np.clip(round(auto_r_end, 3), t_win_start, t_win_end)),
-        step=_win_step,
-    )
+
+    col_a, col_b = st.columns(2, gap="large")
+
+    with col_a:
+        st.markdown("##### 📈 Approach peak window  *(highest frequency)*")
+        a_start = st.slider(
+            "Start (s)", key="a_start",
+            min_value=t_win_start, max_value=t_win_end,
+            value=float(np.clip(round(auto_a_start, 3), t_win_start, t_win_end)),
+            step=_win_step,
+        )
+        a_end = st.slider(
+            "End (s)", key="a_end",
+            min_value=t_win_start, max_value=t_win_end,
+            value=float(np.clip(round(auto_a_end, 3), t_win_start, t_win_end)),
+            step=_win_step,
+        )
+
+    with col_b:
+        st.markdown("##### 📉 Retreat trough window  *(lowest frequency)*")
+        r_start = st.slider(
+            "Start (s)", key="r_start",
+            min_value=t_win_start, max_value=t_win_end,
+            value=float(np.clip(round(auto_r_start, 3), t_win_start, t_win_end)),
+            step=_win_step,
+        )
+        r_end = st.slider(
+            "End (s)", key="r_end",
+            min_value=t_win_start, max_value=t_win_end,
+            value=float(np.clip(round(auto_r_end, 3), t_win_start, t_win_end)),
+            step=_win_step,
+        )
 
 # Validate windows
 a_mask = (t_spec >= a_start) & (t_spec <= a_end)
-r_mask = (t_spec >= r_start) & (t_spec <= r_end)
+r_mask = None
+if r_start is not None and r_end is not None:
+    r_mask = (t_spec >= r_start) & (t_spec <= r_end)
 
 if a_mask.sum() == 0:
     st.error("Approach window contains no spectrogram frames — widen the window.")
     st.stop()
-if r_mask.sum() == 0:
+if r_mask is not None and r_mask.sum() == 0:
     st.error("Retreat window contains no spectrogram frames — widen the window.")
     st.stop()
 
 # Use peak of the interpolated (not smoothed) track for maximum accuracy
 f_approach_val = float(np.max(f_raw[a_mask]))
-f_retreat_val  = float(np.min(f_raw[r_mask]))
+f_retreat_val = None if r_mask is None else float(np.min(f_raw[r_mask]))
 
-if f_approach_val <= f_retreat_val:
+if f_retreat_val is not None and f_approach_val <= f_retreat_val:
     st.warning(
         f"The approaching frequency ({f_approach_val:.1f} Hz) is not higher than the "
         f"retreating frequency ({f_retreat_val:.1f} Hz).  "
@@ -628,30 +650,33 @@ fig_annot.add_vrect(
     x0=a_start, x1=a_end,
     fillcolor="rgba(0,200,100,0.15)",
     line_width=0,
-    annotation_text="approach peak", annotation_position="top left",
+    annotation_text="advancing interval" if f_retreat_val is None else "approach peak",
+    annotation_position="top left",
     annotation_font_color="#00cc66",
 )
 # Shade retreat window
-fig_annot.add_vrect(
-    x0=r_start, x1=r_end,
-    fillcolor="rgba(255,80,80,0.15)",
-    line_width=0,
-    annotation_text="retreat trough", annotation_position="top right",
-    annotation_font_color="#ff5050",
-)
+if f_retreat_val is not None:
+    fig_annot.add_vrect(
+        x0=r_start, x1=r_end,
+        fillcolor="rgba(255,80,80,0.15)",
+        line_width=0,
+        annotation_text="retreat trough", annotation_position="top right",
+        annotation_font_color="#ff5050",
+    )
 # Mark the actual peak / trough on the raw track
 t_a_peak = float(t_spec[a_mask][np.argmax(f_raw[a_mask])])
-t_r_trough = float(t_spec[r_mask][np.argmin(f_raw[r_mask])])
 fig_annot.add_trace(go.Scatter(
     x=[t_a_peak], y=[f_approach_val],
     mode="markers", marker=dict(size=10, color="#00cc66", symbol="diamond"),
     name=f"f_peak = {f_approach_val:.2f} Hz", showlegend=True,
 ))
-fig_annot.add_trace(go.Scatter(
-    x=[t_r_trough], y=[f_retreat_val],
-    mode="markers", marker=dict(size=10, color="#ff5050", symbol="diamond"),
-    name=f"f_trough = {f_retreat_val:.2f} Hz", showlegend=True,
-))
+if f_retreat_val is not None:
+    t_r_trough = float(t_spec[r_mask][np.argmin(f_raw[r_mask])])
+    fig_annot.add_trace(go.Scatter(
+        x=[t_r_trough], y=[f_retreat_val],
+        mode="markers", marker=dict(size=10, color="#ff5050", symbol="diamond"),
+        name=f"f_trough = {f_retreat_val:.2f} Hz", showlegend=True,
+    ))
 fig_annot.add_hline(
     y=f_approach_val,
     line=dict(color="#00cc66", width=1.2, dash="dash"),
@@ -659,13 +684,14 @@ fig_annot.add_hline(
     annotation_font_color="#00cc66",
     annotation_position="right",
 )
-fig_annot.add_hline(
-    y=f_retreat_val,
-    line=dict(color="#ff5050", width=1.2, dash="dash"),
-    annotation_text=f"f_trough = {f_retreat_val:.2f} Hz",
-    annotation_font_color="#ff5050",
-    annotation_position="right",
-)
+if f_retreat_val is not None:
+    fig_annot.add_hline(
+        y=f_retreat_val,
+        line=dict(color="#ff5050", width=1.2, dash="dash"),
+        annotation_text=f"f_trough = {f_retreat_val:.2f} Hz",
+        annotation_font_color="#ff5050",
+        annotation_position="right",
+    )
 
 dark_layout(fig_annot, height=300)
 fig_annot.update_layout(
@@ -680,29 +706,102 @@ st.plotly_chart(fig_annot, width="stretch")
 # ---------------------------------------------------------------------------
 st.header("5 · Results")
 
-ratio, beta, f0_est = doppler_calc(f_approach_val, f_retreat_val)
+if f_retreat_val is None:
+    f0_est = float(f0_known_inp)
+    ratio, beta = doppler_approach_only_calc(f_approach_val, f0_est)
 
-# Guard against degenerate cases
-if f_approach_val <= 0 or f_retreat_val <= 0 or ratio <= 1.0:
-    st.error(
-        "Cannot compute a valid result: the frequency ratio must be > 1 "
-        "(approaching frequency must exceed retreating frequency)."
+    # Guard against degenerate cases
+    if f_approach_val <= 0 or f0_est <= 0 or ratio <= 1.0:
+        st.error(
+            "Cannot compute a valid result: the approach frequency must be "
+            "higher than the base frequency for an advancing source."
+        )
+        st.stop()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric(
+        "f_peak (approach)",
+        f"{f_approach_val:.2f} Hz",
+        help="Maximum interpolated frequency in the selected analysis window.",
     )
-    st.stop()
+    col2.metric(
+        "Base source freq f0",
+        f"{f0_est:.2f} Hz",
+        help="Known unshifted source frequency.",
+    )
+    col3.metric(
+        "f_peak / f0",
+        f"{ratio:.5f}",
+        help="Approach-only Doppler frequency ratio.",
+    )
+else:
+    if f0_known_inp is not None:
+        f0_est = float(f0_known_inp)
+        ratio, retreat_ratio, beta, beta_spread = doppler_known_base_pair_calc(
+            f_approach_val, f_retreat_val, f0_est
+        )
 
-col1, col2, col3 = st.columns(3)
-col1.metric("f_peak (approach)", f"{f_approach_val:.2f} Hz",
-            help="Maximum interpolated frequency in the approach window.")
-col2.metric("f_trough (retreat)", f"{f_retreat_val:.2f} Hz",
-            help="Minimum interpolated frequency in the retreat window.")
-col3.metric("f_peak / f_trough", f"{ratio:.5f}",
-            help="Doppler frequency ratio r.")
+        # Guard against degenerate cases
+        if (
+            f_approach_val <= 0
+            or f_retreat_val <= 0
+            or f0_est <= 0
+            or f_approach_val <= f0_est
+            or f_retreat_val >= f0_est
+            or beta <= 0
+        ):
+            st.error(
+                "Cannot compute a valid result with the explicit base frequency: "
+                "the approach peak must be above f0 and the retreat trough must be below f0."
+            )
+            st.stop()
+    else:
+        ratio, beta, f0_est = doppler_calc(f_approach_val, f_retreat_val)
+
+        # Guard against degenerate cases
+        if f_approach_val <= 0 or f_retreat_val <= 0 or ratio <= 1.0:
+            st.error(
+                "Cannot compute a valid result: the frequency ratio must be > 1 "
+                "(approaching frequency must exceed retreating frequency)."
+            )
+            st.stop()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("f_peak (approach)", f"{f_approach_val:.2f} Hz",
+                help="Maximum interpolated frequency in the approach window.")
+    col2.metric("f_trough (retreat)", f"{f_retreat_val:.2f} Hz",
+                help="Minimum interpolated frequency in the retreat window.")
+    if f0_known_inp is not None:
+        col3.metric("f_peak / f0", f"{ratio:.5f}",
+                    help="Approach-side Doppler ratio using the explicit base frequency.")
+        st.caption(
+            f"Explicit f0 mode: retreat-side ratio f0 / f_trough = {retreat_ratio:.5f}; "
+            "beta is the average of the approach-side and retreat-side estimates."
+        )
+    else:
+        col3.metric("f_peak / f_trough", f"{ratio:.5f}",
+                    help="Doppler frequency ratio r.")
 
 col4, col5, col6 = st.columns(3)
 col4.metric("β = v_s / v_c", f"{beta:.5f}",
             help="Fractional source speed (dimensionless).")
-col5.metric("True source freq f₀ (est.)", f"{f0_est:.1f} Hz",
-            help="f₀ = f_approach × (1 − β)")
+if f_retreat_val is None:
+    col5.metric("True source freq f0", f"{f0_est:.1f} Hz",
+                help="Known unshifted source frequency.")
+elif f0_known_inp is not None:
+    col5.metric(
+        "True source freq f0",
+        f"{f0_est:.1f} Hz",
+        delta=f"beta spread {beta_spread:.5f}",
+        delta_color="off",
+        help=(
+            "Known unshifted source frequency. Beta spread is the difference "
+            "between approach-side and retreat-side beta estimates."
+        ),
+    )
+else:
+    col5.metric("True source freq f0 (est.)", f"{f0_est:.1f} Hz",
+                help="f0 = f_approach x (1 - beta)")
 
 if calc_mode.startswith("Source"):
     v_source_calc = beta * v_sound_inp
@@ -760,8 +859,9 @@ fig_speed.add_hline(y=0, line=dict(color=DARK_ZERO, width=1, dash="dot"))
 # Shade approach / retreat regions
 fig_speed.add_vrect(x0=a_start, x1=a_end,
                     fillcolor="rgba(0,200,100,0.10)", line_width=0)
-fig_speed.add_vrect(x0=r_start, x1=r_end,
-                    fillcolor="rgba(255,80,80,0.10)", line_width=0)
+if f_retreat_val is not None:
+    fig_speed.add_vrect(x0=r_start, x1=r_end,
+                        fillcolor="rgba(255,80,80,0.10)", line_width=0)
 
 fig_speed.add_trace(go.Scatter(
     x=t_spec, y=v_radial,
@@ -773,7 +873,6 @@ fig_speed.add_trace(go.Scatter(
 
 # Mark extremes within the selected windows
 v_approach_profile = v_radial[a_mask]
-v_retreat_profile  = v_radial[r_mask]
 if len(v_approach_profile) and not np.all(np.isnan(v_approach_profile)):
     v_peak_approach = float(np.nanmax(v_approach_profile))
     t_peak_approach = float(t_spec[a_mask][np.nanargmax(v_approach_profile)])
@@ -787,6 +886,11 @@ if len(v_approach_profile) and not np.all(np.isnan(v_approach_profile)):
         name="peak approach",
         showlegend=False,
     ))
+
+if r_mask is not None:
+    v_retreat_profile = v_radial[r_mask]
+else:
+    v_retreat_profile = np.array([])
 
 if len(v_retreat_profile) and not np.all(np.isnan(v_retreat_profile)):
     v_peak_retreat = float(np.nanmin(v_retreat_profile))
@@ -809,6 +913,68 @@ fig_speed.update_layout(
     legend=dict(bgcolor="rgba(0,0,0,0.5)", font=dict(color=DARK_FONT)),
 )
 st.plotly_chart(fig_speed, width="stretch")
+
+# ---------------------------------------------------------------------------
+# 6 · Spectrogram + frequency track
+# ---------------------------------------------------------------------------
+st.header("6 · Spectrogram & frequency track")
+st.caption(
+    f"FFT bin width: **{bin_hz:.2f} Hz/bin** · "
+    f"Frame step: **{frame_ms:.1f} ms** · "
+    f"Sub-bin interpolation enabled (effective resolution < 1 bin)"
+)
+
+fig_spec = go.Figure()
+fig_spec.add_trace(go.Heatmap(
+    x=t_spec,
+    y=f_spec,
+    z=Sxx_db,
+    zmin=vmin, zmax=vmax,
+    colorscale="Viridis",
+    colorbar=dict(title=dict(text="dB", font=dict(color=DARK_FONT)),
+                  tickfont=dict(color=DARK_FONT)),
+    hovertemplate="t=%{x:.3f} s<br>f=%{y:.0f} Hz<br>%{z:.1f} dB<extra></extra>",
+))
+fig_spec.add_trace(go.Scatter(
+    x=t_spec, y=f_smooth,
+    mode="lines",
+    line=dict(color="red", width=2),
+    name="tracked freq",
+    hovertemplate="t=%{x:.3f} s<br>f=%{y:.1f} Hz<extra>tracked</extra>",
+))
+dark_layout(fig_spec, height=350)
+fig_spec.update_layout(
+    xaxis_title="Time (s)",
+    yaxis_title="Frequency (Hz)",
+    legend=dict(
+        bgcolor="rgba(0,0,0,0.5)", font=dict(color=DARK_FONT),
+        x=0.01, y=0.97,
+    ),
+)
+st.plotly_chart(fig_spec, width="stretch")
+
+# Frequency track standalone
+with st.expander("Frequency track detail"):
+    fig_ftrack = go.Figure()
+    fig_ftrack.add_trace(go.Scatter(
+        x=t_spec, y=f_raw,
+        mode="lines",
+        line=dict(color="rgba(100,160,255,0.5)", width=1),
+        name="raw peak",
+    ))
+    fig_ftrack.add_trace(go.Scatter(
+        x=t_spec, y=f_smooth,
+        mode="lines",
+        line=dict(color="orange", width=2),
+        name="smoothed",
+    ))
+    dark_layout(fig_ftrack, height=280)
+    fig_ftrack.update_layout(
+        xaxis_title="Time (s)",
+        yaxis_title="Frequency (Hz)",
+        legend=dict(bgcolor="rgba(0,0,0,0.5)", font=dict(color=DARK_FONT)),
+    )
+    st.plotly_chart(fig_ftrack, width="stretch")
 
 # ---------------------------------------------------------------------------
 # Physics explainer
@@ -851,6 +1017,13 @@ $$
 
 $$
 f_0 = f_{approach} \cdot (1 - \beta) = f_{retreat} \cdot (1 + \beta)
+$$
+
+If only the advancing interval is available and the unshifted source frequency
+$f_0$ is known, the app uses the approach-only form directly:
+
+$$
+\beta = 1 - \frac{f_0}{f_{approach}}
 $$
 
 ---
